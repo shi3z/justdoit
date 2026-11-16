@@ -1,0 +1,1093 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""justdoit: Multi-session autonomous Planner (Session A) + Executor (Session B) + Reviewer (Session C) loop on tmux.
+
+Architecture:
+  - Session A (tmux: justdoit-A): Runs `claude --dangerously-skip-permissions` in Directory A (Planner).
+    Creates and updates the plan for the user's goal, analyzes Session B's output, and generates
+    the next instruction prompt for Session B.
+  - Session B (tmux: justdoit-B): Runs `claude --dangerously-skip-permissions` in Directory B (Executor).
+    Executes instructions received from Session A. Whenever Session B's output changes and settles,
+    its output is captured via `tmux capture-pane` and fed back into Session A.
+  - Session C (tmux: justdoit-C): Runs `agy --dangerously-skip-permissions` in Directory C (Reviewer/Supervisor).
+    Reviews the status and outputs of Session A and Session B periodically (default: every 10 minutes),
+    judges whether intervention is required, and intervenes in Session A and/or Session B when needed.
+
+Environment Variables:
+  - CLAUDE_BIN : Command/binary to use for Sessions A and B (default: `claude`, e.g. `claude-local`)
+  - AGY_BIN    : Command/binary to use for Session C (default: `agy`)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+STATE_ROOT = Path.home() / ".justdoit"
+LATEST_RUN_FILE = STATE_ROOT / "latest_run.json"
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SPINNER_CHARS = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⣯⣽⣻⢿⡿⣟⣯⣷")
+DONE_MARKER_RE = re.compile(r"✻\s+.+?\s+·\s+done\b")
+
+
+def now_iso() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str, log_file: Optional[Path] = None) -> None:
+    line = f"[{now_iso()}] {msg}"
+    print(line, flush=True)
+    if log_file:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+def run_cmd(args: List[str], check: bool = False, timeout: int = 15) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+        timeout=timeout,
+    )
+
+
+def tmux_has_session(session: str) -> bool:
+    res = run_cmd(["tmux", "has-session", "-t", session])
+    return res.returncode == 0
+
+
+def tmux_kill_session(session: str) -> None:
+    if tmux_has_session(session):
+        run_cmd(["tmux", "kill-session", "-t", session])
+
+
+def tmux_new_session(session: str, cwd: Path, cmd: str, width: int = 140, height: int = 45) -> None:
+    tmux_kill_session(session)
+    cwd.mkdir(parents=True, exist_ok=True)
+    run_cmd(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-c",
+            str(cwd.resolve()),
+            "-x",
+            str(width),
+            "-y",
+            str(height),
+            cmd,
+        ],
+        check=True,
+    )
+
+
+def tmux_capture_pane(session: str, history_lines: int = 200) -> str:
+    if not tmux_has_session(session):
+        return ""
+    res = run_cmd(["tmux", "capture-pane", "-t", session, "-p", "-S", f"-{history_lines}"])
+    if res.returncode != 0:
+        return ""
+    return ANSI_RE.sub("", res.stdout)
+
+
+def tmux_capture_visible(session: str) -> str:
+    if not tmux_has_session(session):
+        return ""
+    res = run_cmd(["tmux", "capture-pane", "-t", session, "-p"])
+    if res.returncode != 0:
+        return ""
+    return ANSI_RE.sub("", res.stdout)
+
+
+def tmux_send_keys(session: str, *keys: str) -> None:
+    if not tmux_has_session(session):
+        return
+    run_cmd(["tmux", "send-keys", "-t", session, *keys])
+
+
+def tmux_send_prompt(session: str, text: str, interrupt_first: bool = False) -> None:
+    """Safely paste a (potentially multi-line) prompt into a tmux TUI session and press Enter."""
+    if not tmux_has_session(session):
+        raise RuntimeError(f"tmux session '{session}' does not exist")
+
+    if interrupt_first:
+        tmux_send_keys(session, "Escape")
+        time.sleep(1.0)
+        tmux_send_keys(session, "C-u")
+        time.sleep(0.3)
+
+    buf_name = f"jdi_{session}_{uuid.uuid4().hex[:8]}"
+    clean_text = text.strip()
+    run_cmd(["tmux", "set-buffer", "-b", buf_name, clean_text], check=True)
+    try:
+        run_cmd(["tmux", "paste-buffer", "-b", buf_name, "-t", session, "-p"], check=True)
+    finally:
+        run_cmd(["tmux", "delete-buffer", "-b", buf_name])
+
+    time.sleep(0.6)
+    tmux_send_keys(session, "Enter")
+
+    # Verify submission: if "[Pasted text" or prompt text is still sitting uncommitted in input box, press Enter again
+    time.sleep(1.2)
+    vis = tmux_capture_visible(session)
+    if "paste again to expand" in vis or "[Pasted text" in vis:
+        if "esc to interrupt" not in vis.lower() and "esc to cancel" not in vis.lower():
+            for line in vis.splitlines()[-6:]:
+                if (line.strip().startswith("❯") or line.strip().startswith(">")) and len(line.strip()) > 2:
+                    tmux_send_keys(session, "Enter")
+                    break
+
+
+def handle_startup_dialogs(session: str, tool_kind: str) -> bool:
+    """Auto-accept workspace trust or bypass-permissions dialogs in claude / agy if shown."""
+    vis = tmux_capture_visible(session)
+    if not vis.strip():
+        return False
+
+    if "Yes, I trust this folder" in vis or "Yes, I accept" in vis:
+        lines = [ln.strip() for ln in vis.splitlines() if ln.strip()]
+        no_selected = any(
+            (ln.startswith("❯") or ln.startswith(">")) and ("No," in ln or " exit" in ln)
+            for ln in lines
+        )
+        if no_selected:
+            tmux_send_keys(session, "Down", "Enter")
+        else:
+            tmux_send_keys(session, "Enter")
+        return False
+
+    if tool_kind == "claude":
+        if "❯" in vis and ("bypass permissions" in vis.lower() or "Claude Code" in vis):
+            return True
+    elif tool_kind == "agy":
+        if "? for shortcuts" in vis or "Auto mode:" in vis or "Antigravity CLI" in vis:
+            if "Do you trust the contents" not in vis:
+                return True
+
+    return False
+
+
+def wait_until_sessions_ready(
+    sessions: List[Tuple[str, str]],
+    timeout_sec: int = 45,
+    log_file: Optional[Path] = None,
+) -> None:
+    deadline = time.time() + timeout_sec
+    ready = {name: False for name, _ in sessions}
+    while time.time() < deadline:
+        all_ok = True
+        for name, kind in sessions:
+            if not ready[name]:
+                if handle_startup_dialogs(name, kind):
+                    ready[name] = True
+                    log(f"Session {name} ({kind}) is ready.", log_file)
+                else:
+                    all_ok = False
+        if all_ok:
+            return
+        time.sleep(1.0)
+
+    not_ready = [k for k, v in ready.items() if not v]
+    log(f"Warning: Sessions {not_ready} did not confirm readiness within {timeout_sec}s; proceeding anyway.", log_file)
+
+
+def is_claude_pane_busy(vis: str) -> bool:
+    low = vis.lower()
+    if "esc to interrupt" in low:
+        return True
+    for line in vis.splitlines()[-12:]:
+        s = line.strip()
+        if s and s[0] in SPINNER_CHARS and "· done" not in s and "/effort" not in s:
+            return True
+    return False
+
+
+def is_agy_pane_busy(vis: str) -> bool:
+    low = vis.lower()
+    if "esc to cancel" in low or "generating..." in low or "working..." in low:
+        return True
+    return False
+
+
+def strip_claude_chrome(pane_text: str) -> str:
+    """Strip the bottom prompt box (`────...` and `❯`) from captured Claude TUI pane text."""
+    lines = pane_text.splitlines()
+    # Find the bottom input box separator `────────`
+    cut_idx = len(lines)
+    for i in range(len(lines) - 1, max(-1, len(lines) - 12), -1):
+        s = lines[i].strip()
+        if s.startswith("────────") and i > 0:
+            # Check if `❯` is near this separator
+            nearby = "\n".join(lines[max(0, i - 2) : min(len(lines), i + 3)])
+            if "❯" in nearby:
+                cut_idx = min(cut_idx, i)
+    cleaned_lines = [ln.rstrip() for ln in lines[:cut_idx]]
+    # Remove trailing empty lines or effort status line
+    while cleaned_lines and (
+        not cleaned_lines[-1].strip()
+        or "/effort" in cleaned_lines[-1]
+        or "focus-events off" in cleaned_lines[-1]
+        or "/restart to apply" in cleaned_lines[-1]
+    ):
+        cleaned_lines.pop()
+    return "\n".join(cleaned_lines).strip()
+
+
+def extract_latest_turn_from_pane(full_pane: str, baseline_pane: str) -> Tuple[str, bool]:
+    """Extract the assistant's latest response and tool outputs from a captured tmux pane.
+
+    Returns (extracted_turn_text, has_done_marker_in_latest_turn).
+    """
+    body = strip_claude_chrome(full_pane)
+    lines = body.splitlines()
+
+    # Find the last user prompt line `❯ <something>` in the conversation history
+    last_user_idx = -1
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if stripped.startswith("❯") and len(stripped) > 1:
+            last_user_idx = i
+
+    if last_user_idx >= 0:
+        after_prompt = lines[last_user_idx + 1 :]
+        first_bullet = -1
+        for j, ln in enumerate(after_prompt):
+            if ln.strip().startswith("⏺"):
+                first_bullet = j
+                break
+        if first_bullet >= 0:
+            turn_lines = after_prompt[first_bullet:]
+            has_done = any(DONE_MARKER_RE.search(ln) for ln in turn_lines)
+            cleaned_turn = [ln for ln in turn_lines if not DONE_MARKER_RE.search(ln)]
+            return "\n".join(cleaned_turn).strip(), has_done
+        # User prompt was submitted, waiting for `⏺` response
+        return "", False
+
+    # Fallback when the prompt scrolled above the 200-line history window
+    base_lines = set(strip_claude_chrome(baseline_pane).splitlines())
+    new_lines = [ln for ln in lines if ln not in base_lines]
+    has_done = any(DONE_MARKER_RE.search(ln) for ln in new_lines)
+    diff_lines = [ln for ln in new_lines if not DONE_MARKER_RE.search(ln)]
+    return "\n".join(diff_lines).strip(), has_done
+
+
+class TmuxSessionMonitor:
+    """Pure tmux `capture-pane` monitor for detecting output changes and turn completion."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.baseline_pane = ""
+        self.last_pane = ""
+        self.last_change_time = time.time()
+        self.saw_busy_or_change = False
+
+    def mark_before_send(self) -> None:
+        vis_full = tmux_capture_pane(self.name, history_lines=200)
+        self.baseline_pane = vis_full
+        self.last_pane = vis_full
+        self.last_change_time = time.time()
+        self.saw_busy_or_change = False
+
+    def check_turn_completed(self, sent_at: float) -> Tuple[bool, str]:
+        vis_full = tmux_capture_pane(self.name, history_lines=200)
+        vis_screen = tmux_capture_visible(self.name)
+        now = time.time()
+
+        handle_startup_dialogs(self.name, "claude")
+
+        if vis_full != self.last_pane:
+            self.last_pane = vis_full
+            self.last_change_time = now
+
+        busy = is_claude_pane_busy(vis_screen)
+        if busy or vis_full != self.baseline_pane:
+            self.saw_busy_or_change = True
+
+        stable_secs = now - self.last_change_time
+        elapsed = now - sent_at
+
+        if not self.saw_busy_or_change or busy or elapsed < 2.5:
+            return False, ""
+
+        turn_text, has_done_in_turn = extract_latest_turn_from_pane(vis_full, self.baseline_pane)
+        if not turn_text.strip():
+            return False, ""
+
+        if (has_done_in_turn and stable_secs >= 1.5) or (
+            vis_full != self.baseline_pane and stable_secs >= 6.0 and elapsed >= 6.0
+        ):
+            self.baseline_pane = vis_full
+            self.saw_busy_or_change = False
+            payload = {
+                "turn_text": turn_text.strip(),
+                "pane_screen": strip_claude_chrome(vis_screen),
+            }
+            return True, json.dumps(payload, ensure_ascii=False)
+
+        return False, ""
+
+
+def parse_output_pkg(pkg_str: str) -> Dict[str, str]:
+    try:
+        return json.loads(pkg_str)
+    except json.JSONDecodeError:
+        return {"turn_text": pkg_str, "pane_screen": pkg_str}
+
+
+def extract_next_prompt_from_a(pkg_str: str) -> Tuple[str, bool]:
+    """Extract the instruction prompt for Session B from Session A's captured output."""
+    pkg = parse_output_pkg(pkg_str)
+    text = pkg.get("turn_text") or pkg.get("pane_screen") or ""
+    # Strip leading `⏺ ` prefix from the first line if present
+    text_clean = re.sub(r"^\s*⏺\s*", "", text)
+
+    goal_achieved = "<GOAL_ACHIEVED>" in text_clean
+
+    matches = re.findall(r"<NEXT_PROMPT>(.*?)</NEXT_PROMPT>", text_clean, flags=re.DOTALL)
+    valid_matches = [
+        m.strip()
+        for m in matches
+        if m.strip() and "ここに Session B に実行させる" not in m and "..." not in m[:10]
+    ]
+    if valid_matches:
+        return valid_matches[-1], goal_achieved
+
+    cleaned = re.sub(r"</?NEXT_PROMPT>", "", text_clean).strip()
+    return cleaned, goal_achieved
+
+
+def build_initial_prompt_for_a(goal: str, dir_a: Path, dir_b: Path) -> str:
+    return f"""あなたは自律開発システムの **Session A (Planner / 計画・指示役)** です。
+あなたの作業ディレクトリは `{dir_a}` です。
+一方、実際にコードの作成・変更・コマンド実行を行う **Session B (Executor / 実行役)** は別ディレクトリ `{dir_b}` で起動しています。
+
+## 達成すべき目的 (GOAL)
+{goal}
+
+## あなたの役割とルール
+1. まず目的を達成するための実行計画を立て、`{dir_a}/PLAN.md` に保存してください（必要に応じて `{dir_b}` の現在のファイル状況を確認しても構いませんが、`{dir_b}` の実装作業自体は必ず Session B に指示して行わせてください）。
+2. 計画の最初のステップを **Session B への具体的な指示プロンプト** として出力してください。
+3. Session B に転送する指示プロンプトは、必ず開始タグ `<NEXT_PROMPT>` と終了タグ `</NEXT_PROMPT>` で囲んで出力してください。
+4. 以降、Session B の実行結果・画面出力があなたに流し込まれます。その出力を確認し、計画を更新しつつ次の指示を `<NEXT_PROMPT>` と `</NEXT_PROMPT>` で囲んで出力してください（すべて完了し検証も済んだ場合は `<GOAL_ACHIEVED>` を出力してください）。"""
+
+
+def build_feedback_prompt_for_a(
+    goal: str,
+    iteration: int,
+    b_pkg_str: str,
+    dir_a: Path,
+    dir_b: Path,
+) -> str:
+    b_pkg = parse_output_pkg(b_pkg_str)
+    turn_text = b_pkg.get("turn_text", "").strip()
+    pane_screen = b_pkg.get("pane_screen", "").strip()
+
+    if len(turn_text) > 5000:
+        turn_text = turn_text[:2000] + "\n...(中略)...\n" + turn_text[-3000:]
+    if len(pane_screen) > 3000:
+        pane_screen = pane_screen[-3000:]
+
+    return f"""## Session B の出力更新 (Iteration {iteration})
+目的 (GOAL): {goal}
+
+Session B (`{dir_b}`) の出力内容に変化があり、現在のターンが完了しました。
+
+### Session B の最新応答・出力:
+```
+{turn_text if turn_text else pane_screen}
+```
+
+### Session B の端末画面 (`tmux capture-pane`):
+```
+{pane_screen}
+```
+
+---
+上記の Session B の出力と `{dir_b}` の状態を評価し、`{dir_a}/PLAN.md` の進捗を更新した上で、Session B に次に実行させる指示プロンプトを開始タグ `<NEXT_PROMPT>` と終了タグ `</NEXT_PROMPT>` で囲んで出力してください（目的がすべて完了し検証も済んだ場合は `<GOAL_ACHIEVED>` を併記してください）。"""
+
+
+def build_review_prompt_for_c(
+    goal: str,
+    review_num: int,
+    review_file: Path,
+    session_a: str,
+    session_b: str,
+    dir_a: Path,
+    dir_b: Path,
+    orchestrator_state: str,
+    iteration: int,
+    state_elapsed_sec: int,
+    justdoit_bin: str,
+) -> str:
+    return f"""[定期レビュー #{review_num} (10分周期)]
+あなたは **Session C (Supervisor / 監視・介入役)** です。
+現在稼働中の Session A (Planner: `{session_a}`, dir: `{dir_a}`) と Session B (Executor: `{session_b}`, dir: `{dir_b}`) の状況をレビューし、介入が必要かどうか判断してください。
+
+- **目的 (GOAL)**: {goal}
+- **現在の状態**: `{orchestrator_state}` (Iteration {iteration}, 現状態での経過時間: {state_elapsed_sec}秒)
+- **詳細レビューレポート**: `{review_file}` （このファイルを読み込んで詳細を確認してください）
+
+### 判断基準:
+1. Session B が同じエラーを繰り返している、ハングしている、または目的から逸脱していないか？
+2. Session A の計画や指示がループしている、曖昧すぎる、または必要なテスト/検証を飛ばしていないか？
+3. 順調に計画・実装・検証が進んでいる場合は **介入不要** と判断してください。
+
+### アクション方法:
+- **介入が不要な場合**:
+  現在の進捗の評価を簡潔に述べ、最後に `<NO_INTERVENTION>` と出力してください。
+- **介入が必要な場合**:
+  以下のコマンドを実行して Session A または Session B に介入指示を送るか（ハング時は `--interrupt` を付与）、
+  - `{justdoit_bin} intervene --target A "Session Aへの軌道修正・計画見直し指示"`
+  - `{justdoit_bin} intervene --target B "Session Bへの具体的な修正・打開指示"`
+  または応答内に `<INTERVENE_A>指示内容</INTERVENE_A>` / `<INTERVENE_B>指示内容</INTERVENE_B>` タグを含めて出力してください。"""
+
+
+def write_review_report(
+    review_file: Path,
+    goal: str,
+    review_num: int,
+    orchestrator_state: str,
+    iteration: int,
+    state_elapsed_sec: int,
+    dir_a: Path,
+    dir_b: Path,
+    pane_a: str,
+    pane_b: str,
+    history_tail: List[str],
+) -> None:
+    review_file.parent.mkdir(parents=True, exist_ok=True)
+    plan_file = dir_a / "PLAN.md"
+    plan_content = "(PLAN.md はまだ作成されていません)"
+    if plan_file.exists():
+        try:
+            plan_content = plan_file.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            pass
+
+    try:
+        b_files = [p.name for p in sorted(dir_b.iterdir())[:50]]
+    except OSError:
+        b_files = []
+
+    report = f"""# JustDoIt Periodic Review Report #{review_num}
+- **Timestamp**: {now_iso()}
+- **Goal**: {goal}
+- **Orchestrator State**: `{orchestrator_state}`
+- **Iteration**: {iteration}
+- **Elapsed in Current State**: {state_elapsed_sec} seconds
+- **Directory A (Planner)**: `{dir_a}`
+- **Directory B (Executor)**: `{dir_b}`
+- **Files in Directory B**: {', '.join(b_files) if b_files else '(empty)'}
+
+## Session A `PLAN.md`
+```markdown
+{plan_content}
+```
+
+## Recent Orchestrator Events
+```
+{chr(10).join(history_tail[-25:])}
+```
+
+## Session A Terminal Snapshot (`tmux capture-pane`)
+```
+{pane_a[-3500:] if pane_a else '(empty)'}
+```
+
+## Session B Terminal Snapshot (`tmux capture-pane`)
+```
+{pane_b[-3500:] if pane_b else '(empty)'}
+```
+"""
+    review_file.write_text(report, encoding="utf-8")
+
+
+def create_dashboard_session(
+    dashboard_session: str,
+    session_a: str,
+    session_b: str,
+    session_c: str,
+    log_file: Path,
+) -> None:
+    """Create a 4-pane tmux dashboard session that views Session A, Session B, Session C, and orchestrator logs."""
+    tmux_kill_session(dashboard_session)
+    run_cmd(
+        [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            dashboard_session,
+            "-x",
+            "200",
+            "-y",
+            "60",
+            f"TMUX= tmux attach-session -t {session_a}",
+        ]
+    )
+    run_cmd(
+        [
+            "tmux",
+            "split-window",
+            "-h",
+            "-t",
+            f"{dashboard_session}:0.0",
+            f"TMUX= tmux attach-session -t {session_b}",
+        ]
+    )
+    run_cmd(
+        [
+            "tmux",
+            "split-window",
+            "-v",
+            "-t",
+            f"{dashboard_session}:0.0",
+            f"TMUX= tmux attach-session -t {session_c}",
+        ]
+    )
+    run_cmd(
+        [
+            "tmux",
+            "split-window",
+            "-v",
+            "-t",
+            f"{dashboard_session}:0.1",
+            f"tail -f '{log_file}'",
+        ]
+    )
+    run_cmd(["tmux", "select-layout", "-t", dashboard_session, "tiled"])
+
+
+def save_run_metadata(meta: Dict[str, Any], state_dir: Path) -> None:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    meta_file = state_dir / "run.json"
+    meta_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    LATEST_RUN_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_latest_metadata() -> Dict[str, Any]:
+    if not LATEST_RUN_FILE.exists():
+        print("Error: No active or recent justdoit run found in ~/.justdoit/latest_run.json", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(LATEST_RUN_FILE.read_text(encoding="utf-8"))
+
+
+def cmd_status(_args: argparse.Namespace) -> None:
+    meta = load_latest_metadata()
+    state_dir = Path(meta["state_dir"])
+    status_file = state_dir / "status.json"
+    status = {}
+    if status_file.exists():
+        try:
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+        except OSError:
+            pass
+
+    print("=== JustDoIt Status ===")
+    print(f"Goal           : {meta.get('goal')}")
+    print(f"State Dir      : {state_dir}")
+    print(f"Dir A (Planner): {meta.get('dir_a')}")
+    print(f"Dir B (Worker) : {meta.get('dir_b')}")
+    print(f"Dir C (AGY)    : {meta.get('dir_c')}")
+    print(f"State          : {status.get('state', 'unknown')} (Iteration {status.get('iteration', 0)})")
+    print(f"Last Updated   : {status.get('updated_at', 'unknown')}")
+    print(f"Next Review In : {status.get('next_review_in_sec', '?')}s")
+    print("")
+    for label, sname in [
+        ("Session A (Claude Planner)", meta["session_a"]),
+        ("Session B (Claude Worker) ", meta["session_b"]),
+        ("Session C (AGY Reviewer)  ", meta["session_c"]),
+    ]:
+        alive = tmux_has_session(sname)
+        print(f"--- {label}: tmux session '{sname}' [{'RUNNING' if alive else 'STOPPED'}] ---")
+        if alive:
+            lines = [ln for ln in tmux_capture_visible(sname).splitlines() if ln.strip()]
+            for ln in lines[-8:]:
+                print(f"  {ln}")
+        print("")
+
+
+def cmd_intervene(args: argparse.Namespace) -> None:
+    meta = load_latest_metadata()
+    state_dir = Path(meta["state_dir"])
+    interventions_dir = state_dir / "interventions"
+    interventions_dir.mkdir(parents=True, exist_ok=True)
+
+    target = args.target.upper()
+    if target not in ("A", "B"):
+        print("Error: --target must be A or B", file=sys.stderr)
+        sys.exit(1)
+
+    message = " ".join(args.message).strip()
+    if not message:
+        print("Error: intervention message cannot be empty", file=sys.stderr)
+        sys.exit(1)
+
+    req_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    req_file = interventions_dir / f"{req_id}.json"
+    payload = {
+        "id": req_id,
+        "target": target,
+        "message": message,
+        "interrupt": bool(args.interrupt),
+        "created_at": now_iso(),
+    }
+    req_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[justdoit] Queued intervention for Session {target} ({req_file.name}).")
+
+
+def cmd_review_now(_args: argparse.Namespace) -> None:
+    meta = load_latest_metadata()
+    state_dir = Path(meta["state_dir"])
+    trigger = state_dir / "trigger_review"
+    trigger.write_text(now_iso(), encoding="utf-8")
+    print("[justdoit] Triggered immediate review by Session C.")
+
+
+def cmd_stop(_args: argparse.Namespace) -> None:
+    meta = load_latest_metadata()
+    for key in ("dashboard_session", "session_a", "session_b", "session_c"):
+        sname = meta.get(key)
+        if sname and tmux_has_session(sname):
+            tmux_kill_session(sname)
+            print(f"[justdoit] Killed tmux session: {sname}")
+    pid = meta.get("orchestrator_pid")
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            print(f"[justdoit] Sent SIGTERM to orchestrator PID {pid}")
+        except OSError:
+            pass
+
+
+def cmd_attach(args: argparse.Namespace) -> None:
+    meta = load_latest_metadata()
+    which = (args.which or "dashboard").lower()
+    mapping = {
+        "a": meta["session_a"],
+        "b": meta["session_b"],
+        "c": meta["session_c"],
+        "dashboard": meta.get("dashboard_session", meta["session_a"]),
+        "all": meta.get("dashboard_session", meta["session_a"]),
+    }
+    target = mapping.get(which)
+    if not target:
+        print(f"Error: Unknown attach target '{which}'. Choose from: a, b, c, dashboard", file=sys.stderr)
+        sys.exit(1)
+    os.execvp("tmux", ["tmux", "attach-session", "-t", target])
+
+
+def run_orchestrator(args: argparse.Namespace) -> None:
+    goal = " ".join(args.goal).strip()
+    if not goal:
+        print("Error: Please provide a goal on the command line.\nExample: justdoit \"Create a web paint app\"", file=sys.stderr)
+        sys.exit(1)
+
+    claude_bin = args.claude_bin or os.environ.get("CLAUDE_BIN", "claude")
+    agy_bin = args.agy_bin or os.environ.get("AGY_BIN", "agy")
+
+    for bin_name in ("tmux", claude_bin.split()[0], agy_bin.split()[0]):
+        if not shutil.which(bin_name):
+            print(f"Error: Required command '{bin_name}' not found in PATH.", file=sys.stderr)
+            sys.exit(1)
+
+    # Resolve directories: Session A and Session B MUST be in different directories
+    dir_b = Path(args.dir_b).resolve() if args.dir_b else Path.cwd().resolve()
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", dir_b.name).strip("_") or "workspace"
+    short_hash = hashlib.sha1(str(dir_b).encode("utf-8")).hexdigest()[:8]
+    state_dir = STATE_ROOT / "runs" / f"{slug}_{short_hash}"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    dir_a = Path(args.dir_a).resolve() if args.dir_a else (state_dir / "session_a").resolve()
+    dir_c = Path(args.dir_c).resolve() if args.dir_c else (state_dir / "session_c").resolve()
+
+    if dir_a == dir_b:
+        dir_a = (state_dir / "session_a").resolve()
+
+    dir_a.mkdir(parents=True, exist_ok=True)
+    dir_b.mkdir(parents=True, exist_ok=True)
+    dir_c.mkdir(parents=True, exist_ok=True)
+
+    prefix = args.session_prefix
+    session_a = f"{prefix}-A"
+    session_b = f"{prefix}-B"
+    session_c = f"{prefix}-C"
+    dashboard_session = f"{prefix}-view"
+
+    log_file = state_dir / "orchestrator.log"
+    interventions_dir = state_dir / "interventions"
+    interventions_dir.mkdir(parents=True, exist_ok=True)
+    for old_f in interventions_dir.glob("*.json"):
+        old_f.unlink(missing_ok=True)
+
+    justdoit_bin = str(Path(__file__).resolve())
+
+    meta = {
+        "goal": goal,
+        "state_dir": str(state_dir),
+        "dir_a": str(dir_a),
+        "dir_b": str(dir_b),
+        "dir_c": str(dir_c),
+        "session_a": session_a,
+        "session_b": session_b,
+        "session_c": session_c,
+        "dashboard_session": dashboard_session,
+        "claude_bin": claude_bin,
+        "agy_bin": agy_bin,
+        "review_interval": args.review_interval,
+        "orchestrator_pid": os.getpid(),
+        "started_at": now_iso(),
+    }
+    save_run_metadata(meta, state_dir)
+
+    (state_dir / "GOAL.md").write_text(goal + "\n", encoding="utf-8")
+    (dir_a / "GOAL.md").write_text(goal + "\n", encoding="utf-8")
+
+    log(f"Starting JustDoIt for goal: {goal}", log_file)
+    log(f"  Session A (Planner)  : tmux '{session_a}' in {dir_a} ({claude_bin})", log_file)
+    log(f"  Session B (Executor) : tmux '{session_b}' in {dir_b} ({claude_bin})", log_file)
+    log(f"  Session C (Reviewer) : tmux '{session_c}' in {dir_c} ({agy_bin}, every {args.review_interval}s)", log_file)
+    log(f"  Dashboard Viewer     : tmux attach -t {dashboard_session} (or `justdoit attach`)", log_file)
+
+    cmd_a = f"{claude_bin} --dangerously-skip-permissions --add-dir '{dir_b}'"
+    cmd_b = f"{claude_bin} --dangerously-skip-permissions"
+    cmd_c = f"{agy_bin} --dangerously-skip-permissions --add-dir '{dir_a}' --add-dir '{dir_b}' --add-dir '{state_dir}'"
+
+    tmux_new_session(session_a, dir_a, cmd_a)
+    tmux_new_session(session_b, dir_b, cmd_b)
+    tmux_new_session(session_c, dir_c, cmd_c)
+    create_dashboard_session(dashboard_session, session_a, session_b, session_c, log_file)
+
+    def cleanup_handler(signum: int, _frame: Any) -> None:
+        log(f"Received signal {signum}, stopping orchestrator (tmux sessions remain inspectable or use `justdoit stop`).", log_file)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, cleanup_handler)
+    signal.signal(signal.SIGTERM, cleanup_handler)
+
+    wait_until_sessions_ready(
+        [(session_a, "claude"), (session_b, "claude"), (session_c, "agy")],
+        timeout_sec=45,
+        log_file=log_file,
+    )
+
+    mon_a = TmuxSessionMonitor(session_a)
+    mon_b = TmuxSessionMonitor(session_b)
+
+    history_events: List[str] = []
+
+    def record_event(evt: str) -> None:
+        history_events.append(f"[{now_iso()}] {evt}")
+        log(evt, log_file)
+
+    initial_prompt_a = build_initial_prompt_for_a(goal, dir_a, dir_b)
+    mon_a.mark_before_send()
+    tmux_send_prompt(session_a, initial_prompt_a)
+    state = "WAITING_FOR_A"
+    state_entered_at = time.time()
+    iteration = 1
+    record_event("Sent initial goal & planning request to Session A.")
+
+    last_review_time = time.time()
+    review_count = 0
+    review_in_progress = False
+    review_sent_at = 0.0
+    c_baseline_pane = ""
+    interventions_processed_during_review = 0
+
+    status_file = state_dir / "status.json"
+    trigger_review_file = state_dir / "trigger_review"
+
+    while True:
+        now = time.time()
+
+        if not tmux_has_session(session_a):
+            record_event(f"Warning: {session_a} exited; restarting with -c")
+            tmux_new_session(session_a, dir_a, f"{claude_bin} --dangerously-skip-permissions -c --add-dir '{dir_b}'")
+            wait_until_sessions_ready([(session_a, "claude")], timeout_sec=20, log_file=log_file)
+        if not tmux_has_session(session_b):
+            record_event(f"Warning: {session_b} exited; restarting with -c")
+            tmux_new_session(session_b, dir_b, f"{claude_bin} --dangerously-skip-permissions -c")
+            wait_until_sessions_ready([(session_b, "claude")], timeout_sec=20, log_file=log_file)
+        if not tmux_has_session(session_c):
+            record_event(f"Warning: {session_c} exited; restarting agy")
+            tmux_new_session(session_c, dir_c, cmd_c)
+            wait_until_sessions_ready([(session_c, "agy")], timeout_sec=20, log_file=log_file)
+
+        # 1. Process any queued interventions (from Session C or CLI `justdoit intervene`)
+        for req_file in sorted(interventions_dir.glob("*.json")):
+            try:
+                req = json.loads(req_file.read_text(encoding="utf-8"))
+                req_file.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+            target = req.get("target", "").upper()
+            msg = req.get("message", "").strip()
+            interrupt = bool(req.get("interrupt", False))
+            if not msg or target not in ("A", "B"):
+                continue
+
+            interventions_processed_during_review += 1
+            if target == "A":
+                record_event(f"[INTERVENTION -> Session A] (interrupt={interrupt}): {msg[:160]}")
+                formatted = (
+                    f"## Session C (Supervisor) からの介入指示\n"
+                    f"{msg}\n\n"
+                    f"この介入指示を踏まえて計画を見直し、Session B への新しい指示プロンプトを開始タグ `<NEXT_PROMPT>` と終了タグ `</NEXT_PROMPT>` で囲んで出力してください。"
+                )
+                mon_a.mark_before_send()
+                tmux_send_prompt(session_a, formatted, interrupt_first=interrupt)
+                state = "WAITING_FOR_A"
+                state_entered_at = time.time()
+            elif target == "B":
+                record_event(f"[INTERVENTION -> Session B] (interrupt={interrupt}): {msg[:160]}")
+                formatted = f"[Supervisor 介入指示]\n{msg}"
+                mon_b.mark_before_send()
+                tmux_send_prompt(session_b, formatted, interrupt_first=interrupt)
+                state = "WAITING_FOR_B"
+                state_entered_at = time.time()
+
+        # 2. Check if Session C periodic review (every 10 minutes or manual trigger) should start
+        manual_review = trigger_review_file.exists()
+        if manual_review:
+            trigger_review_file.unlink(missing_ok=True)
+
+        if not review_in_progress and (manual_review or (now - last_review_time >= args.review_interval)):
+            vis_c = tmux_capture_visible(session_c)
+            if not is_agy_pane_busy(vis_c):
+                review_count += 1
+                review_file = state_dir / "reviews" / f"review_{review_count:03d}.md"
+                latest_review_file = state_dir / "latest_review.md"
+                pane_a_snap = tmux_capture_pane(session_a, history_lines=100)
+                pane_b_snap = tmux_capture_pane(session_b, history_lines=100)
+                write_review_report(
+                    review_file=review_file,
+                    goal=goal,
+                    review_num=review_count,
+                    orchestrator_state=state,
+                    iteration=iteration,
+                    state_elapsed_sec=int(now - state_entered_at),
+                    dir_a=dir_a,
+                    dir_b=dir_b,
+                    pane_a=pane_a_snap,
+                    pane_b=pane_b_snap,
+                    history_tail=history_events,
+                )
+                shutil.copyfile(review_file, latest_review_file)
+
+                review_prompt = build_review_prompt_for_c(
+                    goal=goal,
+                    review_num=review_count,
+                    review_file=latest_review_file,
+                    session_a=session_a,
+                    session_b=session_b,
+                    dir_a=dir_a,
+                    dir_b=dir_b,
+                    orchestrator_state=state,
+                    iteration=iteration,
+                    state_elapsed_sec=int(now - state_entered_at),
+                    justdoit_bin=justdoit_bin,
+                )
+                c_baseline_pane = tmux_capture_pane(session_c, history_lines=120)
+                interventions_processed_during_review = 0
+                tmux_send_prompt(session_c, review_prompt)
+                review_in_progress = True
+                review_sent_at = now
+                last_review_time = now
+                record_event(f"Started periodic review #{review_count} in Session C (agy).")
+
+        # 3. Monitor ongoing review in Session C for completion and tag-based interventions
+        if review_in_progress:
+            vis_c = tmux_capture_visible(session_c)
+            full_c = tmux_capture_pane(session_c, history_lines=120)
+            if now - review_sent_at >= 6.0 and not is_agy_pane_busy(vis_c) and full_c != c_baseline_pane:
+                review_in_progress = False
+                record_event(f"Session C finished review #{review_count}.")
+                if interventions_processed_during_review == 0:
+                    new_part = full_c
+                    if c_baseline_pane and c_baseline_pane in full_c:
+                        new_part = full_c.split(c_baseline_pane, 1)[-1]
+                    int_a = re.findall(r"<INTERVENE_A>(.*?)</INTERVENE_A>", new_part, flags=re.DOTALL)
+                    int_b = re.findall(r"<INTERVENE_B>(.*?)</INTERVENE_B>", new_part, flags=re.DOTALL)
+                    for msg_a in int_a:
+                        cleaned_a = msg_a.strip()
+                        if cleaned_a and "指示内容" not in cleaned_a:
+                            req_f = interventions_dir / f"{int(time.time()*1000)}_tagA.json"
+                            req_f.write_text(
+                                json.dumps({"target": "A", "message": cleaned_a, "interrupt": False}),
+                                encoding="utf-8",
+                            )
+                    for msg_b in int_b:
+                        cleaned_b = msg_b.strip()
+                        if cleaned_b and "指示内容" not in cleaned_b:
+                            req_f = interventions_dir / f"{int(time.time()*1000)}_tagB.json"
+                            req_f.write_text(
+                                json.dumps({"target": "B", "message": cleaned_b, "interrupt": False}),
+                                encoding="utf-8",
+                            )
+
+        # 4. Main Session A <-> Session B state machine
+        if state == "WAITING_FOR_A":
+            done_a, out_a = mon_a.check_turn_completed(state_entered_at)
+            if done_a:
+                prompt_for_b, goal_achieved = extract_next_prompt_from_a(out_a)
+                (state_dir / f"turn_{iteration:03d}_A_to_B.md").write_text(prompt_for_b, encoding="utf-8")
+                preview = prompt_for_b.replace("\n", " ")[:140]
+                record_event(f"Session A produced instruction for Session B (iter {iteration}): {preview}...")
+
+                if goal_achieved and args.stop_on_complete:
+                    record_event("Session A declared <GOAL_ACHIEVED> and --stop-on-complete is set. Exiting loop.")
+                    break
+
+                mon_b.mark_before_send()
+                tmux_send_prompt(session_b, prompt_for_b)
+                state = "WAITING_FOR_B"
+                state_entered_at = time.time()
+                record_event(f"Forwarded instruction to Session B (iter {iteration}). Waiting for Session B output...")
+
+        elif state == "WAITING_FOR_B":
+            done_b, out_b = mon_b.check_turn_completed(state_entered_at)
+            if done_b:
+                (state_dir / f"turn_{iteration:03d}_B_output.json").write_text(out_b, encoding="utf-8")
+                b_pkg = parse_output_pkg(out_b)
+                preview = (b_pkg.get("turn_text") or b_pkg.get("pane_screen") or "").replace("\n", " ")[:140]
+                record_event(f"Session B output changed & turn completed (iter {iteration}): {preview}...")
+
+                feedback_for_a = build_feedback_prompt_for_a(
+                    goal=goal,
+                    iteration=iteration,
+                    b_pkg_str=out_b,
+                    dir_a=dir_a,
+                    dir_b=dir_b,
+                )
+                iteration += 1
+                mon_a.mark_before_send()
+                tmux_send_prompt(session_a, feedback_for_a)
+                state = "WAITING_FOR_A"
+                state_entered_at = time.time()
+                record_event(f"Fed Session B output back into Session A (iter {iteration}). Waiting for Session A...")
+
+        # 5. Update status.json
+        try:
+            status_data = {
+                "goal": goal,
+                "state": state,
+                "iteration": iteration,
+                "state_elapsed_sec": int(now - state_entered_at),
+                "review_count": review_count,
+                "review_in_progress": review_in_progress,
+                "next_review_in_sec": max(0, int(args.review_interval - (now - last_review_time))),
+                "updated_at": now_iso(),
+            }
+            status_file.write_text(json.dumps(status_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+        time.sleep(1.0)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="justdoit",
+        description=(
+            "Launch 3 tmux sessions: Session A (Planner), Session B (Executor in a separate directory), "
+            "and Session C (Reviewer every 10 minutes), cycling B's output into A and A's instructions into B."
+        ),
+    )
+    parser.add_argument(
+        "--dir-a",
+        help="Working directory for Session A (Planner). Defaults to ~/.justdoit/runs/<slug>/session_a",
+    )
+    parser.add_argument(
+        "--dir-b",
+        help="Working directory for Session B (Executor). Defaults to current working directory",
+    )
+    parser.add_argument(
+        "--dir-c",
+        help="Working directory for Session C (Reviewer). Defaults to ~/.justdoit/runs/<slug>/session_c",
+    )
+    parser.add_argument(
+        "--claude-bin",
+        help="CLI command for Sessions A & B (default: $CLAUDE_BIN or 'claude', e.g. 'claude-local')",
+    )
+    parser.add_argument(
+        "--agy-bin",
+        help="CLI command for Session C (default: $AGY_BIN or 'agy')",
+    )
+    parser.add_argument(
+        "--review-interval",
+        type=int,
+        default=600,
+        help="Review interval in seconds for Session C (default: 600 = 10 minutes)",
+    )
+    parser.add_argument(
+        "--session-prefix",
+        default="justdoit",
+        help="Prefix for tmux sessions (creates <prefix>-A, <prefix>-B, <prefix>-C, <prefix>-view)",
+    )
+    parser.add_argument(
+        "--stop-on-complete",
+        action="store_true",
+        help="Stop the loop automatically if Session A outputs <GOAL_ACHIEVED>",
+    )
+    parser.add_argument(
+        "goal",
+        nargs="*",
+        help="The goal to accomplish (or a subcommand: status, attach, intervene, review-now, stop)",
+    )
+    return parser
+
+
+def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] in ("status", "attach", "intervene", "review-now", "stop", "kill"):
+        sub = sys.argv[1]
+        sub_argv = sys.argv[2:]
+        if sub == "status":
+            cmd_status(argparse.Namespace())
+        elif sub in ("stop", "kill"):
+            cmd_stop(argparse.Namespace())
+        elif sub == "review-now":
+            cmd_review_now(argparse.Namespace())
+        elif sub == "attach":
+            p = argparse.ArgumentParser(prog="justdoit attach")
+            p.add_argument("which", nargs="?", default="dashboard", help="a | b | c | dashboard")
+            cmd_attach(p.parse_args(sub_argv))
+        elif sub == "intervene":
+            p = argparse.ArgumentParser(prog="justdoit intervene")
+            p.add_argument("-t", "--target", required=True, choices=["A", "B", "a", "b"], help="Target session (A or B)")
+            p.add_argument("-i", "--interrupt", action="store_true", help="Send Escape first to interrupt target session")
+            p.add_argument("message", nargs="+", help="Intervention prompt to send")
+            cmd_intervene(p.parse_args(sub_argv))
+        return
+
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.goal:
+        parser.print_help()
+        sys.exit(1)
+    run_orchestrator(args)
+
+
+if __name__ == "__main__":
+    main()
